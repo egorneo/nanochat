@@ -18,11 +18,12 @@ import json
 import time
 import math
 import argparse
+from numbers import Number
 from dataclasses import asdict
 from contextlib import nullcontext, contextmanager
 
-import wandb
 import torch
+from clearml import Task
 
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
@@ -39,9 +40,10 @@ print_banner()
 # CLI arguments
 parser = argparse.ArgumentParser(description="Pretrain base model")
 # Logging
-parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
+parser.add_argument("--run", type=str, default="dummy", help="clearml task name ('dummy' disables remote logging)")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
+parser.add_argument("--remote", action="store_true", help="enqueue on ClearML queue '4090-1x' and exit locally")
 # FP8 training
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
@@ -79,9 +81,11 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
+if args.remote and args.run == "dummy":
+    raise ValueError("--remote requires a non-dummy --run task name")
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
-# Compute init and wandb logging
+# Compute init and remote logging
 
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
@@ -96,9 +100,60 @@ if device_type == "cuda":
 else:
     gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
 
-# wandb logging init
-use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
+class ClearMLRun:
+    """Small adapter that mirrors DummyWandb's .log/.finish interface."""
+    def __init__(self, project: str, name: str, config: dict, remote: bool = False):
+        self.task = Task.init(
+            project_name=project,
+            task_name=name,
+            auto_connect_frameworks=False,
+        )
+
+        self.task.set_base_docker(
+            docker_image="pytorch/pytorch:2.3.1-cuda11.8-cudnn8-runtime",
+            docker_arguments=['--shm-size=8g'],
+            docker_setup_bash_script=[
+                "apt update && apt install -y libgl1-mesa-glx",
+                "pip install opencv-contrib-python",
+                "pip install opencv-python",
+                "pip install huggingface_hub==0.23.2",
+                "pip install safetensors"
+            ]
+        )
+        self.task.connect(config, name="config")
+        if remote:
+            print0("Enqueuing task to ClearML queue: 4090-1x")
+            self.task.execute_remotely(queue_name="4090-1x", exit_process=True)
+        self.logger = self.task.get_logger()
+
+    def _log_item(self, key, value, step):
+        if isinstance(value, dict):
+            for sub_key, sub_value in value.items():
+                self._log_item(f"{key}/{sub_key}", sub_value, step)
+            return
+        if isinstance(value, Number) and not isinstance(value, bool):
+            if "/" in key:
+                title, series = key.split("/", 1)
+            else:
+                title, series = "metrics", key
+            self.logger.report_scalar(title=title, series=series, value=float(value), iteration=step)
+            return
+        text_payload = f"{key}: {json.dumps(value, ensure_ascii=True, default=str)}"
+        self.logger.report_text(text_payload, print_console=False)
+
+    def log(self, data: dict):
+        step = int(data.get("step", 0))
+        for key, value in data.items():
+            if key == "step":
+                continue
+            self._log_item(key, value, step)
+
+    def finish(self):
+        self.task.close()
+
+# clearml logging init
+use_dummy_logger = args.run == "dummy" or not master_process
+logger_run = DummyWandb() if use_dummy_logger else ClearMLRun(project="nanochat", name=args.run, config=user_config, remote=args.remote)
 
 # Flash Attention status
 if HAS_FA3:
@@ -410,7 +465,7 @@ while True:
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
-        wandb_run.log({
+        logger_run.log({
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
@@ -427,7 +482,7 @@ while True:
         with disable_fp8(orig_model), autocast_ctx:
             results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
-        wandb_run.log({
+        logger_run.log({
             "step": step,
             "total_training_flops": flops_so_far,
             "core_metric": results["core_metric"],
@@ -547,7 +602,7 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
-        wandb_run.log(log_data)
+        logger_run.log(log_data)
 
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
@@ -596,5 +651,5 @@ get_report().log(section="Base model training", data=[
 ])
 
 # cleanup
-wandb_run.finish() # wandb run finish
+logger_run.finish() # remote logger finish
 compute_cleanup()
