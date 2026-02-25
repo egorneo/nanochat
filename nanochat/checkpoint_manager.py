@@ -39,7 +39,7 @@ def _patch_missing_keys(model_data, model_config):
         model_data["x0_lambdas"] = torch.zeros(n_layer)
         log0(f"Patching missing x0_lambdas in model data to 0.0")
 
-def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
+def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0, task=None):
     if rank == 0:
         os.makedirs(checkpoint_dir, exist_ok=True)
         # Save the model state parameters
@@ -50,6 +50,15 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
         meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta_data, f, indent=2)
+        if task:
+            task.upload_artifact(
+                name="checkpoints_dir",
+                artifact_object=checkpoint_dir
+            )
+            task.upload_artifact(
+                name="meta",
+                artifact_object=meta_data
+            )
         logger.info(f"Saved metadata to: {meta_path}")
     # Note that optimizer state is sharded across ranks, so each rank must save its own.
     if optimizer_data is not None:
