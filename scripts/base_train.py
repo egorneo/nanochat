@@ -21,9 +21,10 @@ import argparse
 from numbers import Number
 from dataclasses import asdict
 from contextlib import nullcontext, contextmanager
+import subprocess
 
 import torch
-from clearml import Task
+from clearml import Task, logger
 
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
@@ -110,20 +111,29 @@ class ClearMLRun:
         )
 
         self.task.set_base_docker(
-            docker_image="pytorch/pytorch:2.3.1-cuda11.8-cudnn8-runtime",
+            docker_image="pytorch/pytorch:2.3.1-cuda11.8-cudnn8-devel",
             docker_arguments=['--shm-size=8g'],
             docker_setup_bash_script=[
-                "apt update && apt install -y libgl1-mesa-glx",
+                "apt update && apt install -y build-essential git libgl1-mesa-glx",
+                "pip install --upgrade pip",
                 "pip install opencv-contrib-python",
                 "pip install opencv-python",
                 "pip install huggingface_hub==0.23.2",
                 "pip install safetensors"
             ]
         )
+
         self.task.connect(config, name="config")
         if remote:
             print0("Enqueuing task to ClearML queue: 4090-1x")
             self.task.execute_remotely(queue_name="4090-1x", exit_process=True)
+
+        def _run(cmd):
+            print(f"\n>>> {cmd}\n", flush=True)
+            subprocess.run(cmd, shell=True, check=True)
+        _run("python -m nanochat.dataset -n 80")
+        _run("python -m scripts.tok_train")
+
         self.logger = self.task.get_logger()
 
     def _log_item(self, key, value, step):
@@ -513,28 +523,30 @@ while True:
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
-        save_checkpoint(
-            checkpoint_dir,
-            step,
-            orig_model.state_dict(), # model parameters
-            optimizer.state_dict(), # optimizer state
-            { # metadata saved as json
-                "step": step,
-                "val_bpb": val_bpb, # loss at last step
-                "model_config": model_config_kwargs,
-                "user_config": user_config, # inputs to the training script
-                "device_batch_size": args.device_batch_size,
-                "max_seq_len": args.max_seq_len,
-                "total_batch_size": total_batch_size,
-                "dataloader_state_dict": dataloader_state_dict,
-                "loop_state": { # all loop state (other than step) so that we can resume training
-                    "min_val_bpb": min_val_bpb,
-                    "smooth_train_loss": smooth_train_loss,
-                    "total_training_time": total_training_time,
+        if logger_run:
+            save_checkpoint(
+                checkpoint_dir,
+                step,
+                orig_model.state_dict(), # model parameters
+                optimizer.state_dict(), # optimizer state
+                { # metadata saved as json
+                    "step": step,
+                    "val_bpb": val_bpb, # loss at last step
+                    "model_config": model_config_kwargs,
+                    "user_config": user_config, # inputs to the training script
+                    "device_batch_size": args.device_batch_size,
+                    "max_seq_len": args.max_seq_len,
+                    "total_batch_size": total_batch_size,
+                    "dataloader_state_dict": dataloader_state_dict,
+                    "loop_state": { # all loop state (other than step) so that we can resume training
+                        "min_val_bpb": min_val_bpb,
+                        "smooth_train_loss": smooth_train_loss,
+                        "total_training_time": total_training_time,
+                    },
                 },
-            },
-            rank=ddp_rank,
-        )
+                rank=ddp_rank,
+                task=logger_run.task,
+            )
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
     if last_step:
